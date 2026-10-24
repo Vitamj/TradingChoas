@@ -23,6 +23,21 @@ jobs:
           ruff format --check trading_chaos_api test/mlops
       - name: Test with coverage
         run: pytest -q test/mlops --cov=trading_chaos_api --cov-report=term-missing
+      - name: Smoke test with PostgreSQL
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8000/api/v1/health 2>/dev/null | python -c 'import json, sys; assert json.load(sys.stdin)["components"]["database"]["status"] == "ok"' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Stop containers
+        if: always()
+        run: docker compose down -v
 
   publish:
     needs: check
