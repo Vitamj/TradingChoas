@@ -1,0 +1,14 @@
+.git
+.github
+.venv*
+__pycache__
+*.pyc
+*.csv
+*.parquet
+*.ipynb
+src
+input
+output
+test
+docs
+requirements.txt

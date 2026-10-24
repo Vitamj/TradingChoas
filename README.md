@@ -140,3 +140,34 @@ python -m pytest -q test/basic_backtest
 - `docs/project_lanes.md` - разделение проекта на обычный бектест, ML-бектест и оптимизацию.
 - `docs/mt5_data_recorder.md` - запись Brent H1 из MetaTrader 5.
 - `output/README.md` - Telegram-уведомления и управление торговлей.
+
+## MLOps: веб-приложение (ДЗ 2)
+
+Веб-приложение лежит в `trading_chaos_api`. Оно запускается отдельно от торгового контура и использует PostgreSQL для проверки доступности внешнего компонента. Зависимости приложения вынесены в `pyproject.toml`; версии для сборки образа закреплены в `requirements-api.lock`.
+
+Для локального запуска нужны Docker и Docker Compose:
+
+```bash
+cp .env.example .env
+# Замени POSTGRES_PASSWORD в .env
+docker compose up --build
+```
+
+После запуска:
+
+- `GET http://localhost:8000/healthz` — быстрая проверка приложения без обращения к БД;
+- `GET http://localhost:8000/api/v1/version` — версия приложения и ревизия сборки;
+- `GET http://localhost:8000/api/v1/health` — версия PostgreSQL и время ответа. При ошибке БД возвращается 503.
+
+Для разработки без Docker:
+
+```bash
+python -m venv .venv-api
+.venv-api/bin/pip install -e '.[dev]'
+.venv-api/bin/pre-commit install
+.venv-api/bin/ruff check trading_chaos_api test/mlops
+.venv-api/bin/ruff format --check trading_chaos_api test/mlops
+.venv-api/bin/pytest -q test/mlops --cov=trading_chaos_api
+```
+
+CI запускает линтер, проверку форматирования и тесты с покрытием. После успешного push в `hw2` или `main` CD собирает образ и публикует его в GitHub Container Registry с тегом `sha-<12 символов коммита>`. Используется GHCR, потому что он доступен из GitHub Actions через `GITHUB_TOKEN`, без отдельного ключа реестра. Лог сборки и адрес опубликованного образа видны в Actions → API → publish.

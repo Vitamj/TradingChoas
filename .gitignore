@@ -33,6 +33,9 @@ logs/
 
 # Файлы окружения
 .env
+htmlcov/
+.coverage
+*.egg-info/
 output/*.local.json*
 
 # Кэш
