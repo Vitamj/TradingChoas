@@ -1,0 +1,164 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+      POSTGRES_DB: mlflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      - mlflow_network
+
+  minio:
+    image: docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mlflow}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mlflow-secret}
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+    networks:
+      - mlflow_network
+
+
+  create-bucket:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    depends_on:
+      minio:
+        condition: service_started
+    command:
+      - python
+      - -c
+      - |
+        import os
+        import time
+        import boto3
+        from botocore.exceptions import ClientError
+
+        client = boto3.client(
+            "s3",
+            endpoint_url="http://minio:9000",
+            aws_access_key_id=os.environ["MINIO_ROOT_USER"],
+            aws_secret_access_key=os.environ["MINIO_ROOT_PASSWORD"],
+            region_name="us-east-1",
+        )
+
+        for attempt in range(60):
+            try:
+                client.create_bucket(Bucket="mlflow-artifacts")
+                print("Bucket mlflow-artifacts is ready")
+                break
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
+                    print("Bucket mlflow-artifacts already exists")
+                    break
+                if attempt == 59:
+                    raise
+                time.sleep(2)
+            except Exception:
+                if attempt == 59:
+                    raise
+                time.sleep(2)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mlflow}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mlflow-secret}
+    restart: "no"
+    networks:
+      - mlflow_network
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-mlflow}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-mlflow-secret}
+      AWS_DEFAULT_REGION: us-east-1
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - postgresql+psycopg2://mlflow:${POSTGRES_PASSWORD:-mlflow}@postgres:5432/mlflow
+      - --artifacts-destination
+      - s3://mlflow-artifacts
+      - --serve-artifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      - mlflow_network
+
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["train"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: BrentDirectionModel
+      MODEL_ALIAS: champion
+      DATA_PATH: /data/brent_prices.csv
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    command: ["python", "-m", "app.train"]
+    networks:
+      - mlflow_network
+
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["inference"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: BrentDirectionModel
+      MODEL_ALIAS: champion
+    ports:
+      - "8000:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    networks:
+      - mlflow_network
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  mlflow_network:
+    driver: bridge

@@ -41,3 +41,6 @@ output/*.local.json*
 # Кэш
 __pycache__/
 *.pyc
+
+!mlflow_hw3/data/
+!mlflow_hw3/data/brent_prices.csv
