@@ -48,7 +48,7 @@ docker compose up -d --build
 Открой:
 
 - MLflow UI: http://localhost:5000
-- MinIO Console: http://localhost:9001
+- MinIO Console: http://localhost:9003
 
 Локальные учётные данные MinIO находятся в `.env.example`. Они предназначены только для учебного запуска.
 
