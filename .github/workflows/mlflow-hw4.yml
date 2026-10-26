@@ -35,7 +35,7 @@ jobs:
       - name: Format
         run: ruff format app tests
       - name: Unit tests
-        run: pytest -q -m "not integration" --cov=app --cov-report=term-missing
+        run: python -m pytest -q -m "not integration" --cov=app --cov-report=term-missing
       - name: Validate Compose configuration
         run: docker compose config -q
 
@@ -52,7 +52,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Test queue overflow with Testcontainers
         working-directory: mlflow_hw4
-        run: pytest -q -m integration tests/test_rabbitmq_integration.py
+        run: python -m pytest -q -m integration tests/test_rabbitmq_integration.py
       - name: Start HW3 MLflow
         working-directory: mlflow_hw3
         run: |
