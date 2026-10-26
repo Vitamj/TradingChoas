@@ -1,0 +1,4 @@
+scenario,workers,queue_limit,broker_x_max_length,generated,accepted,source_tasks_per_second,source_retries,max_ready_depth,mean_ready_depth,max_rabbit_node_memory_mb,max_rabbit_container_memory_mb,max_workers_memory_mb,avg_processing_ms,p95_processing_ms,completed,failed,experiment_elapsed_seconds,batch_id
+bounded_1_worker,1,12,11,180,180,2.9116,195,12,9.176,137.477,204.3,213.6,352.074,358.347,180,0,70.569,bounded_1_worker-a12672fc
+bounded_2_workers,2,12,11,180,180,5.7424,160,12,8.0,137.422,204.6,409.4,351.087,357.909,180,0,37.253,bounded_2_workers-1911c6b8
+unbounded_1_worker,1,0,0,180,180,175.3605,0,166,78.029,137.762,205.4,216.2,352.42,358.596,180,0,70.436,unbounded_1_worker-c13a44f6

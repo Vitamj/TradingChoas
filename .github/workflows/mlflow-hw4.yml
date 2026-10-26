@@ -1,0 +1,139 @@
+name: HW4 Backpressure
+
+on:
+  push:
+    branches: [hw4]
+    paths:
+      - "mlflow_hw4/**"
+      - ".github/workflows/mlflow-hw4.yml"
+  pull_request:
+    branches: [main, hw3]
+    paths:
+      - "mlflow_hw4/**"
+      - ".github/workflows/mlflow-hw4.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: mlflow_hw4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: mlflow_hw4/requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check app tests
+      - name: Format
+        run: ruff format app tests
+      - name: Unit tests
+        run: pytest -q -m "not integration" --cov=app --cov-report=term-missing
+      - name: Validate Compose configuration
+        run: docker compose config -q
+
+  integration:
+    needs: checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: mlflow_hw4
+        run: python -m pip install -r requirements-dev.txt
+      - name: Test queue overflow with Testcontainers
+        working-directory: mlflow_hw4
+        run: pytest -q -m integration tests/test_rabbitmq_integration.py
+      - name: Start HW3 MLflow
+        working-directory: mlflow_hw3
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          for attempt in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:5000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Train registered model
+        working-directory: mlflow_hw3
+        run: docker compose --profile train run --rm --build trainer
+      - name: Start HW4 services
+        working-directory: mlflow_hw4
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          for attempt in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null && curl -fsS http://127.0.0.1:8001/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Smoke test task API
+        working-directory: mlflow_hw4
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          from urllib.request import Request, urlopen
+
+          closes = [80.0, 80.4, 80.1, 80.8, 81.0, 80.7, 81.2, 81.4, 81.1, 81.6, 82.0]
+          payload = {
+              "candles": [
+                  {
+                      "date": f"2024-01-{index + 1:02d}T00:00:00Z",
+                      "open": close,
+                      "high": close + 0.3,
+                      "low": close - 0.3,
+                      "close": close,
+                      "volume": 100,
+                  }
+                  for index, close in enumerate(closes)
+              ]
+          }
+          request = Request(
+              "http://127.0.0.1:8000/api/v1/tasks",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urlopen(request, timeout=10) as response:
+              accepted = json.load(response)
+          deadline = time.monotonic() + 60
+          while time.monotonic() < deadline:
+              with urlopen(f"http://127.0.0.1:8000/api/v1/tasks/{accepted['task_id']}", timeout=5) as response:
+                  result = json.load(response)
+              if result["status"] == "SUCCEEDED":
+                  print(json.dumps(result, indent=2))
+                  break
+              if result["status"] == "FAILED":
+                  raise AssertionError(result)
+              time.sleep(1)
+          else:
+              raise TimeoutError("Task did not complete")
+          PY
+      - name: Show service logs on failure
+        if: failure()
+        working-directory: mlflow_hw4
+        run: docker compose logs
+      - name: Stop HW4 services
+        if: always()
+        working-directory: mlflow_hw4
+        run: docker compose down -v
+      - name: Stop HW3 services
+        if: always()
+        working-directory: mlflow_hw3
+        run: docker compose down -v

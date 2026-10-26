@@ -1,0 +1,17 @@
+services:
+  topology:
+    environment:
+      TASK_QUEUE: tasks.unbounded
+      QUEUE_MAX_LENGTH: "0"
+  api:
+    environment:
+      TASK_QUEUE: tasks.unbounded
+      QUEUE_MAX_LENGTH: "0"
+  worker:
+    environment:
+      TASK_QUEUE: tasks.unbounded
+      QUEUE_MAX_LENGTH: "0"
+  source:
+    environment:
+      TASK_QUEUE: tasks.unbounded
+      QUEUE_MAX_LENGTH: "0"

@@ -1,0 +1,17 @@
+services:
+  topology:
+    environment:
+      TASK_QUEUE: tasks.bounded
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-11}"
+  api:
+    environment:
+      TASK_QUEUE: tasks.bounded
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-11}"
+  worker:
+    environment:
+      TASK_QUEUE: tasks.bounded
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-11}"
+  source:
+    environment:
+      TASK_QUEUE: tasks.bounded
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-11}"
