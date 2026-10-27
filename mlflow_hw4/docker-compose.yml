@@ -1,0 +1,144 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-hw4}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-hw4-rabbit-password}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  results-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hw4
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hw4-local-password}
+      POSTGRES_DB: hw4
+    volumes:
+      - results_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hw4 -d hw4"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  topology:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.topology"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hw4}:${RABBITMQ_PASSWORD:-hw4-rabbit-password}@rabbitmq:5672/
+      TASK_QUEUE: ${TASK_QUEUE:-tasks.bounded}
+      QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-11}
+      MAX_DELIVERIES: ${MAX_DELIVERIES:-3}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hw4}:${RABBITMQ_PASSWORD:-hw4-rabbit-password}@rabbitmq:5672/
+      DATABASE_URL: postgresql://hw4:${POSTGRES_PASSWORD:-hw4-local-password}@results-db:5432/hw4
+      TASK_QUEUE: ${TASK_QUEUE:-tasks.bounded}
+      QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-11}
+      MAX_DELIVERIES: ${MAX_DELIVERIES:-3}
+      INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.25}
+      PREFETCH_COUNT: ${PREFETCH_COUNT:-1}
+    ports:
+      - "8000:8000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      results-db:
+        condition: service_healthy
+      topology:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    init: true
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.worker:app", "--host", "0.0.0.0", "--port", "8001", "--timeout-graceful-shutdown", "90"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hw4}:${RABBITMQ_PASSWORD:-hw4-rabbit-password}@rabbitmq:5672/
+      DATABASE_URL: postgresql://hw4:${POSTGRES_PASSWORD:-hw4-local-password}@results-db:5432/hw4
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://host.docker.internal:5000}
+      MODEL_NAME: ${MODEL_NAME:-BrentDirectionModel}
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      TASK_QUEUE: ${TASK_QUEUE:-tasks.bounded}
+      QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-11}
+      PREFETCH_COUNT: ${PREFETCH_COUNT:-1}
+      MAX_DELIVERIES: ${MAX_DELIVERIES:-3}
+      INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.25}
+      GRACEFUL_TIMEOUT_SECONDS: ${GRACEFUL_TIMEOUT_SECONDS:-90}
+    ports:
+      - "8001:8001"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      results-db:
+        condition: service_healthy
+      topology:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 100s
+    restart: unless-stopped
+    init: true
+
+  source:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.source"]
+    profiles: ["source"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hw4}:${RABBITMQ_PASSWORD:-hw4-rabbit-password}@rabbitmq:5672/
+      TASK_QUEUE: ${TASK_QUEUE:-tasks.bounded}
+      QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-11}
+      MAX_DELIVERIES: ${MAX_DELIVERIES:-3}
+      DATA_PATH: /data/brent_prices.csv
+      SOURCE_TASK_COUNT: ${SOURCE_TASK_COUNT:-180}
+    volumes:
+      - ../mlflow_hw3/data:/data:ro
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      topology:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+
+volumes:
+  rabbitmq_data:
+  results_db_data:
