@@ -3,7 +3,6 @@ import asyncio
 import csv
 import hashlib
 import json
-import logging
 import time
 from collections import deque
 from itertools import islice
@@ -11,13 +10,13 @@ from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
+from prometheus_client import start_http_server
 
-from app.config import DATA_PATH, SOURCE_TASK_COUNT
+from app.config import DATA_PATH, METRICS_PORT, SOURCE_TASK_COUNT
 from app.features import candles_to_payload
+from app.metrics import SOURCE_PUBLISHED, SOURCE_REJECTED, SOURCE_WAIT
 from app.publisher import PublishRejected, TaskPublisher
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logger = logging.getLogger(__name__)
+from app.telemetry import bind_task, logger, reset_task, tracer
 
 
 def read_candles(path: Path):
@@ -107,27 +106,40 @@ async def run_source(path: Path, count: int, batch_id: str) -> dict[str, object]
             "elapsed_seconds": elapsed,
             "accepted_per_second": accepted / elapsed if elapsed else 0.0,
         }
-        print(json.dumps(snapshot, sort_keys=True), flush=True)
+        logger.info("source_progress", **snapshot)
 
     save_progress()
     async with TaskPublisher() as publisher:
         for payload in islice(task_stream(path, batch_id, count), count):
             generated += 1
             backoff = 0.05
-            while True:
-                attempt_started = time.perf_counter()
-                try:
-                    await publisher.publish(payload)
-                    publish_latencies.append((time.perf_counter() - attempt_started) * 1000)
-                    accepted += 1
-                    save_progress()
-                    break
-                except PublishRejected:
-                    rejected += 1
-                    retries += 1
-                    save_progress()
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 1.0)
+            token = bind_task(payload["task_id"])
+            try:
+                with tracer.start_as_current_span(
+                    "source task",
+                    attributes={"task.id": payload["task_id"], "batch.id": batch_id},
+                ) as span:
+                    while True:
+                        attempt_started = time.perf_counter()
+                        try:
+                            await publisher.publish(payload)
+                            SOURCE_PUBLISHED.inc()
+                            publish_latencies.append((time.perf_counter() - attempt_started) * 1000)
+                            accepted += 1
+                            save_progress()
+                            break
+                        except PublishRejected:
+                            rejected += 1
+                            retries += 1
+                            SOURCE_REJECTED.inc()
+                            SOURCE_WAIT.inc(backoff)
+                            span.add_event("backpressure_wait", {"retry.delay.seconds": backoff})
+                            logger.warning("publish_rejected", retry=retries, wait_seconds=backoff)
+                            save_progress()
+                            await asyncio.sleep(backoff)
+                            backoff = min(backoff * 2, 1.0)
+            finally:
+                reset_task(token)
     elapsed = time.perf_counter() - started
     summary = {
         "batch_id": batch_id,
@@ -141,12 +153,12 @@ async def run_source(path: Path, count: int, batch_id: str) -> dict[str, object]
             sum(publish_latencies) / len(publish_latencies) if publish_latencies else 0.0
         ),
     }
-    logger.info("source_finished %s", json.dumps(summary, sort_keys=True))
-    print(json.dumps(summary, sort_keys=True))
+    logger.info("source_finished", **summary)
     return summary
 
 
 async def main() -> None:
+    start_http_server(METRICS_PORT)
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=SOURCE_TASK_COUNT)
     parser.add_argument("--batch-id", default=f"batch-{uuid4().hex[:12]}")

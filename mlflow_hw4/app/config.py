@@ -23,6 +23,7 @@ RETRY_AFTER_SECONDS = max(1, math.ceil(INFERENCE_DELAY_SECONDS))
 DATA_PATH = os.getenv("DATA_PATH", "/data/brent_prices.csv")
 SOURCE_TASK_COUNT = int(os.getenv("SOURCE_TASK_COUNT", "180"))
 RABBITMQ_MANAGEMENT_URL = os.getenv("RABBITMQ_MANAGEMENT_URL", "http://localhost:15672")
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9100"))
 
 
 def queue_arguments(include_type: bool = True) -> dict[str, object]:

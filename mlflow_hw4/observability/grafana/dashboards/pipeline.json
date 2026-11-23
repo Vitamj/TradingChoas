@@ -1,0 +1,20 @@
+{
+  "title": "Конвейер",
+  "uid": "pipeline-hw5",
+  "schemaVersion": 40,
+  "refresh": "5s",
+  "time": {"from": "now-15m", "to": "now"},
+  "templating": {"list": [
+    {"name": "worker", "type": "query", "datasource": {"uid": "prometheus"}, "query": "label_values(pipeline_worker_tasks_total, worker)", "includeAll": true, "multi": true},
+    {"name": "service", "type": "query", "datasource": {"uid": "loki"}, "query": "label_values(service)", "includeAll": true, "multi": true}
+  ]},
+  "panels": [
+    {"id": 1, "title": "Глубина основной очереди", "type": "timeseries", "gridPos": {"x":0,"y":0,"w":8,"h":8}, "fieldConfig":{"defaults":{"unit":"short","thresholds":{"mode":"absolute","steps":[{"color":"green"},{"color":"red","value":11}]}}}, "targets":[{"datasource":{"uid":"prometheus"},"expr":"rabbitmq_queue_messages_ready{queue=\"tasks.bounded\"}","legendFormat":"ready"},{"datasource":{"uid":"prometheus"},"expr":"vector(11)","legendFormat":"limit"}]},
+    {"id": 2, "title": "Источник и воркеры", "type": "timeseries", "gridPos": {"x":8,"y":0,"w":8,"h":8}, "fieldConfig":{"defaults":{"unit":"ops"}}, "targets":[{"datasource":{"uid":"prometheus"},"expr":"rate(pipeline_source_published_total[1m])","legendFormat":"source"},{"datasource":{"uid":"prometheus"},"expr":"sum(rate(pipeline_worker_tasks_total{result=\"ok\"}[1m]))","legendFormat":"workers total"},{"datasource":{"uid":"prometheus"},"expr":"rate(pipeline_worker_tasks_total{result=\"ok\",worker=~\"$worker\"}[1m])","legendFormat":"{{worker}}"}]},
+    {"id": 3, "title": "Inference p50 / p95 / p99", "type": "timeseries", "gridPos": {"x":16,"y":0,"w":8,"h":8}, "fieldConfig":{"defaults":{"unit":"s"}}, "targets":[{"datasource":{"uid":"prometheus"},"expr":"histogram_quantile(0.50, sum by (le) (rate(pipeline_inference_duration_seconds_bucket[5m])))","legendFormat":"p50"},{"datasource":{"uid":"prometheus"},"expr":"histogram_quantile(0.95, sum by (le) (rate(pipeline_inference_duration_seconds_bucket[5m])))","legendFormat":"p95"},{"datasource":{"uid":"prometheus"},"expr":"histogram_quantile(0.99, sum by (le) (rate(pipeline_inference_duration_seconds_bucket[5m])))","legendFormat":"p99"}]},
+    {"id": 4, "title": "API p50 / p95 / p99", "type": "timeseries", "gridPos": {"x":0,"y":8,"w":8,"h":8}, "fieldConfig":{"defaults":{"unit":"s"}}, "targets":[{"datasource":{"uid":"prometheus"},"expr":"histogram_quantile(0.50, sum by (le) (rate(pipeline_api_request_duration_seconds_bucket[5m])))","legendFormat":"p50"},{"datasource":{"uid":"prometheus"},"expr":"histogram_quantile(0.95, sum by (le) (rate(pipeline_api_request_duration_seconds_bucket[5m])))","legendFormat":"p95"},{"datasource":{"uid":"prometheus"},"expr":"histogram_quantile(0.99, sum by (le) (rate(pipeline_api_request_duration_seconds_bucket[5m])))","legendFormat":"p99"}]},
+    {"id": 5, "title": "503 / отказы / DLQ", "type": "timeseries", "gridPos": {"x":8,"y":8,"w":8,"h":8}, "fieldConfig":{"defaults":{"unit":"ops"}}, "targets":[{"datasource":{"uid":"prometheus"},"expr":"rate(pipeline_api_requests_total{status=\"503\"}[1m])","legendFormat":"API 503"},{"datasource":{"uid":"prometheus"},"expr":"rate(pipeline_source_rejected_total[1m])","legendFormat":"publish rejected"},{"datasource":{"uid":"prometheus"},"expr":"rabbitmq_queue_messages{queue=\"tasks.bounded.dlq\"}","legendFormat":"DLQ"}]},
+    {"id": 6, "title": "Память процессов", "type": "timeseries", "gridPos": {"x":16,"y":8,"w":8,"h":8}, "fieldConfig":{"defaults":{"unit":"bytes"}}, "targets":[{"datasource":{"uid":"prometheus"},"expr":"process_resident_memory_bytes{job=~\"worker|source|api\"}","legendFormat":"{{job}} {{instance}}"}]},
+    {"id": 7, "title": "Последние ошибки", "type": "logs", "gridPos": {"x":0,"y":16,"w":24,"h":8}, "targets":[{"datasource":{"uid":"loki"},"expr":"{service=~\"$service\",level=~\"error|critical\"} | json"}]}
+  ]
+}

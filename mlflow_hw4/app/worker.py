@@ -1,5 +1,6 @@
 import asyncio
-import logging
+import contextvars
+import os
 import time
 from contextlib import asynccontextmanager
 from uuid import UUID
@@ -17,6 +18,9 @@ from faststream.rabbit import (
     QueueType,
 )
 from mlflow import MlflowClient
+from opentelemetry import context as otel_context, propagate, trace
+from opentelemetry.trace import SpanKind
+from prometheus_client import make_asgi_app
 
 from app.config import (
     GRACEFUL_TIMEOUT_SECONDS,
@@ -39,9 +43,8 @@ from app.database import (
     start_task,
 )
 from app.features import build_feature_frame
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logger = logging.getLogger(__name__)
+from app.metrics import INFERENCE_DURATION, WORKER_ACTIVE, WORKER_REDELIVERIES, WORKER_TASKS
+from app.telemetry import bind_task, instrument_fastapi, logger, reset_task, tracer
 
 broker = RabbitBroker(
     RABBITMQ_URL,
@@ -59,6 +62,7 @@ MODEL = None
 MODEL_VERSION: str | None = None
 MODEL_RUN_ID: str | None = None
 ACTIVE_TASKS = 0
+WORKER_ID = os.getenv("HOSTNAME", "worker-local")
 
 
 def _delivery_count(message: RabbitMessage) -> int:
@@ -94,12 +98,10 @@ async def _retry_or_dead_letter(
                 # by the durable DLQ and can be reconciled later.
                 await fail_task(DB_POOL, task_id, error)
             except Exception:
-                logger.exception("task_final_state_failed task_id=%s", task_id)
+                logger.exception("task_final_state_failed")
+        WORKER_TASKS.labels("dlq", WORKER_ID).inc()
         logger.error(
-            "task_dead_lettered task_id=%s delivery_count=%s max_deliveries=%s",
-            task_id,
-            delivery_count,
-            MAX_DELIVERIES,
+            "task_dead_lettered", delivery_count=delivery_count, max_deliveries=MAX_DELIVERIES
         )
         await message.reject(requeue=False)
         return
@@ -108,7 +110,8 @@ async def _retry_or_dead_letter(
         try:
             await mark_retrying(DB_POOL, task_id, error)
         except Exception:
-            logger.exception("task_retry_state_failed task_id=%s", task_id)
+            logger.exception("task_retry_state_failed")
+    WORKER_REDELIVERIES.labels(WORKER_ID).inc()
     # Use reject rather than nack: RabbitMQ counts basic.reject as a failed
     # delivery for quorum-queue delivery-limit enforcement.
     await message.reject(requeue=True)
@@ -133,7 +136,7 @@ async def load_registered_model():
 async def handle_task(payload: dict, message: RabbitMessage) -> None:
     global ACTIVE_TASKS
     if not isinstance(payload, dict):
-        logger.warning("invalid_task_payload_type type=%s", type(payload).__name__)
+        logger.warning("invalid_task_payload_type", payload_type=type(payload).__name__)
         await message.reject(requeue=False)
         return
 
@@ -141,50 +144,92 @@ async def handle_task(payload: dict, message: RabbitMessage) -> None:
     payload_hash = payload.get("payload_hash")
     batch_id = payload.get("batch_id")
     if not task_id_value or not payload_hash or not isinstance(payload.get("candles"), list):
-        logger.warning("invalid_task_envelope task_id=%s", task_id_value)
+        logger.warning("invalid_task_envelope", supplied_task_id=task_id_value)
         await message.reject(requeue=False)
         return
 
     try:
         task_id = UUID(str(task_id_value))
     except (TypeError, ValueError, AttributeError):
-        logger.warning("invalid_task_id task_id=%s", task_id_value)
+        logger.warning("invalid_task_id", supplied_task_id=task_id_value)
         await message.reject(requeue=False)
         return
 
+    parent_context = propagate.extract(message.headers or {})
+    process_span = tracer.start_span(
+        "process",
+        context=parent_context,
+        kind=SpanKind.CONSUMER,
+        attributes={
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": TASK_QUEUE,
+            "messaging.message.id": str(task_id),
+            "messaging.rabbitmq.delivery_count": _delivery_count(message),
+        },
+    )
+    context_token = otel_context.attach(trace.set_span_in_context(process_span))
+    task_token = bind_task(task_id)
+
     try:
-        status = await start_task(DB_POOL, task_id, str(payload_hash), batch_id)
+        with tracer.start_as_current_span("db.start_task"):
+            status = await start_task(DB_POOL, task_id, str(payload_hash), batch_id)
         if status in {"SUCCEEDED", "FAILED"}:
             await message.ack()
+            reset_task(task_token)
+            otel_context.detach(context_token)
+            process_span.end()
             return
     except ValueError as exc:
         # Reusing an ID with a different payload is a permanent contract error,
         # not a transient infrastructure failure worth retrying.
-        logger.error("task_envelope_conflict task_id=%s error=%s", task_id, exc)
+        logger.error("task_envelope_conflict", error=str(exc))
         await message.reject(requeue=False)
+        process_span.record_exception(exc)
+        process_span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+        reset_task(task_token)
+        otel_context.detach(context_token)
+        process_span.end()
         return
-    except Exception:
-        logger.exception("task_start_failed task_id=%s", task_id_value)
+    except Exception as exc:
+        logger.exception("task_start_failed")
+        process_span.record_exception(exc)
+        process_span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
         await _retry_or_dead_letter(message, task_id, "Could not start task in database")
+        reset_task(task_token)
+        otel_context.detach(context_token)
+        process_span.end()
         return
 
     ACTIVE_TASKS += 1
+    WORKER_ACTIVE.labels(WORKER_ID).inc()
     started = time.perf_counter()
     try:
         if payload.get("simulate_failure"):
             raise RuntimeError("Simulated inference failure")
-        features = build_feature_frame(payload["candles"])
-        await asyncio.sleep(INFERENCE_DELAY_SECONDS)
-        prediction = int(
-            np.asarray(await asyncio.to_thread(MODEL.predict, features)).reshape(-1)[0]
-        )
-        probability_up = None
-        if hasattr(MODEL, "predict_proba"):
-            probabilities = np.asarray(await asyncio.to_thread(MODEL.predict_proba, features))[0]
-            classes = np.asarray(getattr(MODEL, "classes_", [0, 1]))
-            indexes = np.flatnonzero(classes == 1)
-            if len(indexes):
-                probability_up = float(probabilities[indexes[0]])
+        with tracer.start_as_current_span(
+            "inference",
+            attributes={"model.alias": MODEL_ALIAS, "model.version": str(MODEL_VERSION)},
+        ):
+            inference_started = time.perf_counter()
+            features = build_feature_frame(payload["candles"])
+            await asyncio.sleep(INFERENCE_DELAY_SECONDS)
+            copied_context = contextvars.copy_context()
+            prediction = int(
+                np.asarray(
+                    await asyncio.to_thread(copied_context.run, MODEL.predict, features)
+                ).reshape(-1)[0]
+            )
+            probability_up = None
+            if hasattr(MODEL, "predict_proba"):
+                copied_context = contextvars.copy_context()
+                probabilities = np.asarray(
+                    await asyncio.to_thread(copied_context.run, MODEL.predict_proba, features)
+                )[0]
+                classes = np.asarray(getattr(MODEL, "classes_", [0, 1]))
+                indexes = np.flatnonzero(classes == 1)
+                if len(indexes):
+                    probability_up = float(probabilities[indexes[0]])
+            INFERENCE_DURATION.labels(WORKER_ID).observe(time.perf_counter() - inference_started)
         processing_ms = (time.perf_counter() - started) * 1000
         result = {
             "prediction": prediction,
@@ -195,28 +240,32 @@ async def handle_task(payload: dict, message: RabbitMessage) -> None:
             "model_version": MODEL_VERSION,
             "run_id": MODEL_RUN_ID,
         }
-        await complete_task(
-            DB_POOL,
-            task_id,
-            str(payload_hash),
-            batch_id,
-            result,
-            str(MODEL_VERSION),
-            str(MODEL_RUN_ID),
-            processing_ms,
-        )
+        with tracer.start_as_current_span("db.write_result"):
+            await complete_task(
+                DB_POOL,
+                task_id,
+                str(payload_hash),
+                batch_id,
+                result,
+                str(MODEL_VERSION),
+                str(MODEL_RUN_ID),
+                processing_ms,
+            )
         await message.ack()
-        logger.info(
-            "task_succeeded task_id=%s model_version=%s processing_ms=%.3f",
-            task_id,
-            MODEL_VERSION,
-            processing_ms,
-        )
+        WORKER_TASKS.labels("ok", WORKER_ID).inc()
+        logger.info("task_succeeded", model_version=MODEL_VERSION, processing_ms=processing_ms)
     except Exception as exc:
-        logger.exception("task_processing_failed task_id=%s", task_id_value)
+        WORKER_TASKS.labels("error", WORKER_ID).inc()
+        process_span.record_exception(exc)
+        process_span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+        logger.exception("task_processing_failed", delivery_attempt=_delivery_count(message) + 1)
         await _retry_or_dead_letter(message, task_id, str(exc))
     finally:
         ACTIVE_TASKS = max(0, ACTIVE_TASKS - 1)
+        WORKER_ACTIVE.labels(WORKER_ID).dec()
+        reset_task(task_token)
+        otel_context.detach(context_token)
+        process_span.end()
 
 
 @asynccontextmanager
@@ -226,12 +275,12 @@ async def lifespan(app: FastAPI):
     await ensure_schema(DB_POOL)
     MODEL, MODEL_VERSION, MODEL_RUN_ID = await load_registered_model()
     logger.info(
-        "model_loaded model=%s alias=%s version=%s run_id=%s prefetch_count=%s",
-        MODEL_NAME,
-        MODEL_ALIAS,
-        MODEL_VERSION,
-        MODEL_RUN_ID,
-        PREFETCH_COUNT,
+        "model_loaded",
+        model=MODEL_NAME,
+        alias=MODEL_ALIAS,
+        version=MODEL_VERSION,
+        run_id=MODEL_RUN_ID,
+        prefetch_count=PREFETCH_COUNT,
     )
     await broker.start()
     app.state.model_version = MODEL_VERSION
@@ -239,12 +288,16 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        logger.info("graceful_shutdown_started", active_tasks=ACTIVE_TASKS)
         await broker.stop()
         await DB_POOL.close()
         DB_POOL = None
+        logger.info("graceful_shutdown_finished")
 
 
 app = FastAPI(title="FastStream Inference Worker", version="1.0.0", lifespan=lifespan)
+app.mount("/metrics", make_asgi_app())
+instrument_fastapi(app)
 
 
 @app.get("/healthz")

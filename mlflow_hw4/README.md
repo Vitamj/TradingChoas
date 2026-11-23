@@ -1,4 +1,77 @@
-# ДЗ4. Противодавление в FastStream и RabbitMQ
+# ДЗ5. Наблюдаемость конвейера FastStream и RabbitMQ
+
+ДЗ5 развивает конвейер ДЗ4 без нового бизнес-сервиса. Теперь одну задачу
+можно проследить от HTTP/source до RabbitMQ, inference и PostgreSQL по
+структурированным логам, единому trace_id и метрикам.
+
+## Выбор стека наблюдаемости
+
+- **structlog + stdout JSON**: единый формат у приложения и библиотек,
+  контекст задачи добавляется через ContextVar, а не вручную. Docker-файлы
+  логов приложение не знает и не открывает.
+- **Grafana Alloy + Loki**: Loki индексирует только низкокардинальные
+  `service`, `level`, `env`; `task_id`, `trace_id` остаются JSON-полями.
+  Иначе 6000 задач создали бы тысячи потоков и резко увеличили индекс.
+- **OpenTelemetry Collector + Tempo**: SDK посылает OTLP только в Collector.
+  `memory_limiter` стоит перед `batch`, чтобы ограничить память до накопления
+  пакетов. W3C `traceparent` передаётся в заголовках RabbitMQ.
+- **Prometheus pull**: API/воркер/source отдают `/metrics`, RabbitMQ — метрики
+  штатного плагина на 15692. Source поднимает endpoint на время пакетного
+  процесса, поэтому Prometheus успевает собрать его счётчики; для процессов
+  короче scrape interval в production потребовался бы Pushgateway или OTLP.
+
+Для стенда выбран `parentbased_always_on`: на защите важен каждый poison/503
+trace. При сотнях задач/с в production разумен parent-based probability sampler
+(например, 5–10%) и tail sampling в Collector, сохраняющий 100% ERROR и медленных
+трейсов.
+
+## Запуск профилей
+
+Обычный запуск не требует хранилищ телеметрии:
+
+``` powershell
+docker compose up -d --build
+docker compose --profile logs up -d
+docker compose --profile traces up -d
+docker compose --profile metrics up -d
+docker compose --profile observability up -d --build
+```
+
+Если Collector выключен, OTLP exporter отбрасывает данные пакетами и приложение
+продолжает работать. Для полностью отключённого SDK установите
+`OTEL_SDK_DISABLED=true`. Приложение не имеет `depends_on` на observability.
+
+После полного запуска Grafana доступна на http://localhost:3000. Datasources,
+дашборд «Конвейер» и два alert rule появляются без кликов. Лог содержит ссылку
+на Tempo по `trace_id`, а Tempo строит запрос логов этого трейса в Loki.
+
+## Метрики и кардинальность
+
+Основные серии: API (`route`, `method`, `status`), worker (`result`, `worker`),
+гистограммы latency (`le`, worker) и метрики RabbitMQ. Ни task_id, ни trace_id
+не являются label. При 4 route × 2 method × 6 status API counter имеет максимум
+48 рядов; worker counter при 3 result × 2 worker — 6; inference histogram при
+12 bucket (+ sum/count) × 2 worker — 28. Это ограниченные десятки рядов вместо
+тысяч на каждую задачу. Бакеты inference сгущены вокруг настроенных 0.25 секунды.
+
+Алерт заполнения использует порог 90% в течение минуты: краткий пик допустим,
+устойчивое заполнение означает исчерпанный запас. DLQ имеет `for: 10s`, чтобы
+избежать дребезга между scrape, но любое оставшееся poison-сообщение считается
+ошибкой.
+
+## Ресурсный бюджет
+
+Лимиты полного стека: Collector 128 MiB, Alloy 128 MiB, Loki 256 MiB, Tempo
+256 MiB, Prometheus 256 MiB, Grafana 256 MiB — всего **1280 MiB**. Retention
+Loki, Tempo и Prometheus — 48 часов. После нагрузочного прогона фактические
+значения проверяются командой:
+
+``` powershell
+docker stats --no-stream
+```
+
+Фактические цифры зависят от Docker Desktop и должны быть внесены в протокол
+защиты после запуска на машине студента; выдуманные значения здесь не приведены.
 
 В этой работе мы собрали конвейер для обработки цен Brent. Источник
 отправляет задачи в RabbitMQ, воркер получает их и запускает inference

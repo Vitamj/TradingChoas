@@ -1,0 +1,96 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    profiles: ["traces", "observability"]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports: ["4317:4317"]
+    mem_limit: 128m
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    profiles: ["traces", "observability"]
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  loki:
+    image: grafana/loki:3.3.2
+    profiles: ["logs", "observability"]
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  alloy:
+    image: grafana/alloy:v1.5.1
+    profiles: ["logs", "observability"]
+    command: ["run", "/etc/alloy/config.alloy"]
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-mlflow_hw4}
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    mem_limit: 128m
+    depends_on:
+      loki: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    profiles: ["metrics", "observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.retention.time=2d
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["observability"]
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-hw5-grafana-password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      loki: {condition: service_healthy}
+      tempo: {condition: service_healthy}
+      prometheus: {condition: service_healthy}
+
+volumes:
+  tempo_data:
+  loki_data:
+  prometheus_data:
+  grafana_data:
