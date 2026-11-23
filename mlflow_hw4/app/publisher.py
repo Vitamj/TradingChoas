@@ -2,6 +2,8 @@ import json
 from typing import Any
 
 import aio_pika
+from opentelemetry import propagate, trace
+from opentelemetry.trace import SpanKind
 from pamqp.commands import Basic
 from aiormq.exceptions import DeliveryError
 
@@ -30,29 +32,41 @@ class TaskPublisher:
     async def publish(self, envelope: dict[str, Any]) -> None:
         if self.channel is None:
             raise RuntimeError("Publisher is not connected")
-        message = aio_pika.Message(
-            body=json.dumps(envelope, separators=(",", ":")).encode("utf-8"),
-            content_type="application/json",
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            message_id=str(envelope["task_id"]),
-            headers={
+        tracer = trace.get_tracer("trading-chaos.publisher")
+        with tracer.start_as_current_span(
+            f"publish {TASK_QUEUE}",
+            kind=SpanKind.PRODUCER,
+            attributes={"messaging.system": "rabbitmq", "messaging.destination.name": TASK_QUEUE},
+        ) as span:
+            headers = {
                 "batch_id": envelope.get("batch_id") or "",
                 "payload_hash": envelope["payload_hash"],
-            },
-        )
-        try:
-            confirmation = await self.channel.default_exchange.publish(
-                message,
-                routing_key=TASK_QUEUE,
-                mandatory=True,
+            }
+            propagate.inject(headers)
+            message = aio_pika.Message(
+                body=json.dumps(envelope, separators=(",", ":")).encode("utf-8"),
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                message_id=str(envelope["task_id"]),
+                correlation_id=str(envelope["task_id"]),
+                headers=headers,
             )
-        except DeliveryError as exc:
-            raise PublishRejected("RabbitMQ rejected the publish") from exc
-
-        if isinstance(confirmation, Basic.Nack):
-            raise PublishRejected("RabbitMQ rejected the publish because the queue is full")
-        if not isinstance(confirmation, Basic.Ack):
-            raise PublishRejected("RabbitMQ did not positively confirm the publish")
+            try:
+                confirmation = await self.channel.default_exchange.publish(
+                    message,
+                    routing_key=TASK_QUEUE,
+                    mandatory=True,
+                )
+            except DeliveryError as exc:
+                span.record_exception(exc)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+                raise PublishRejected("RabbitMQ rejected the publish") from exc
+            if isinstance(confirmation, Basic.Nack):
+                span.set_status(trace.Status(trace.StatusCode.ERROR, "publish rejected"))
+                raise PublishRejected("RabbitMQ rejected the publish because the queue is full")
+            if not isinstance(confirmation, Basic.Ack):
+                span.set_status(trace.Status(trace.StatusCode.ERROR, "publish unconfirmed"))
+                raise PublishRejected("RabbitMQ did not positively confirm the publish")
 
     async def close(self) -> None:
         if self.connection is not None and not self.connection.is_closed:

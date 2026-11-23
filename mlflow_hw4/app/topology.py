@@ -3,6 +3,7 @@ import asyncio
 import aio_pika
 
 from app.config import DLQ_NAME, DLX_NAME, RABBITMQ_URL, TASK_QUEUE, queue_arguments
+from app.telemetry import logger
 
 
 async def declare_topology() -> None:
@@ -30,7 +31,7 @@ async def main() -> None:
     for attempt in range(60):
         try:
             await declare_topology()
-            print(f"Topology ready: queue={TASK_QUEUE}, dlq={DLQ_NAME}")
+            logger.info("topology_ready", queue=TASK_QUEUE, dlq=DLQ_NAME)
             return
         except Exception as exc:
             last_error = exc

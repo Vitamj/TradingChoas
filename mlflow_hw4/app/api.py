@@ -1,11 +1,12 @@
 import json
-import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
 import aio_pika
 from fastapi import FastAPI, HTTPException, Request, Response
+from prometheus_client import make_asgi_app
 
 from app.config import RETRY_AFTER_SECONDS, RABBITMQ_URL, TASK_QUEUE
 from app.database import (
@@ -18,13 +19,13 @@ from app.database import (
 )
 from app.publisher import PublishRejected, TaskPublisher
 from app.schemas import TaskAccepted, TaskRequest, TaskStatus, make_envelope, payload_digest
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logger = logging.getLogger(__name__)
+from app.metrics import API_DURATION, API_REQUESTS
+from app.telemetry import bind_task, instrument_fastapi, logger, reset_task, tracer
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("service_starting")
     pool = await create_pool()
     await ensure_schema(pool)
     publisher = TaskPublisher(RABBITMQ_URL)
@@ -34,26 +35,53 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        logger.info("graceful_shutdown_started")
         await publisher.close()
         await pool.close()
+        logger.info("graceful_shutdown_finished")
 
 
 app = FastAPI(title="Backpressure Task API", version="1.0.0", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def observe_request(request: Request, call_next):
+    started = time.perf_counter()
+    status = 500
+    route = request.url.path
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        matched_route = request.scope.get("route")
+        route = getattr(matched_route, "path", route)
+        if route not in {"/healthz", "/metrics", "/metrics/"}:
+            API_REQUESTS.labels(route, request.method, str(status)).inc()
+            API_DURATION.labels(route, request.method).observe(time.perf_counter() - started)
+
+
+app.mount("/metrics", make_asgi_app())
+instrument_fastapi(app)
+
+
 async def submit_task(payload: TaskRequest, pool, publisher) -> tuple[TaskAccepted, int]:
+    token = bind_task(payload.task_id)
     digest = payload_digest(payload)
-    row = await create_pending(pool, payload.task_id, digest, payload.batch_id)
+    with tracer.start_as_current_span("db.create_pending"):
+        row = await create_pending(pool, payload.task_id, digest, payload.batch_id)
     if row is None:
         existing = await get_task(pool, payload.task_id)
         if existing is None:
+            reset_task(token)
             raise HTTPException(status_code=503, detail="Task storage is temporarily unavailable")
         if existing["payload_hash"] != digest:
+            reset_task(token)
             raise HTTPException(
                 status_code=409,
                 detail="task_id was already used with a different payload",
             )
-        return (
+        result = (
             TaskAccepted(
                 task_id=payload.task_id,
                 status=existing["status"],
@@ -61,13 +89,16 @@ async def submit_task(payload: TaskRequest, pool, publisher) -> tuple[TaskAccept
             ),
             200,
         )
+        reset_task(token)
+        return result
 
     envelope = make_envelope(payload)
     try:
         await publisher.publish(envelope)
     except (PublishRejected, aio_pika.exceptions.DeliveryError) as exc:
         await delete_pending(pool, payload.task_id)
-        logger.warning("task_rejected task_id=%s reason=%s", payload.task_id, str(exc))
+        logger.warning("task_rejected", reason=str(exc), queue=TASK_QUEUE)
+        reset_task(token)
         raise HTTPException(
             status_code=503,
             detail="The processing queue is full. Retry the request later.",
@@ -75,14 +106,16 @@ async def submit_task(payload: TaskRequest, pool, publisher) -> tuple[TaskAccept
         ) from exc
     except Exception as exc:
         await delete_pending(pool, payload.task_id)
-        logger.exception("task_publish_failed task_id=%s", payload.task_id)
+        logger.exception("task_publish_failed")
+        reset_task(token)
         raise HTTPException(
             status_code=503,
             detail="The processing service is temporarily unavailable.",
             headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
         ) from exc
 
-    logger.info("task_accepted task_id=%s queue=%s", payload.task_id, TASK_QUEUE)
+    logger.info("task_accepted", queue=TASK_QUEUE)
+    reset_task(token)
     return TaskAccepted(task_id=payload.task_id, status="PENDING", idempotent_replay=False), 202
 
 
